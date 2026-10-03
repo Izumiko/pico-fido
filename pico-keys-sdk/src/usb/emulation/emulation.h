@@ -20,16 +20,18 @@
 
 #include <stdint.h>
 #include <string.h>
-#include "queue.h"
-#include "board.h"
+#include "compat/queue.h"
+#include "compat/board.h"
 #include <stdbool.h>
+#include "byte_array.h"
 
-#define USB_BUFFER_SIZE 2048
-extern int emul_init(char *host, uint16_t port);
+#define USB_BUFFER_SIZE 4096
+extern int emul_init(const char *host, uint16_t port);
 extern uint8_t emul_rx[USB_BUFFER_SIZE];
 extern uint16_t emul_rx_size, emul_tx_size;
-extern uint16_t driver_write_emul(uint8_t itf, const uint8_t *buffer, uint16_t buffer_size);
+extern uint16_t driver_write_emul(uint8_t itf, const_byte_array_t buffer);
 extern uint16_t emul_read(uint8_t itf);
+extern void emul_task(void);
 
 #ifdef USB_ITF_HID
 typedef uint8_t hid_report_type_t;
@@ -51,7 +53,7 @@ static inline uint32_t tud_vendor_n_read(uint8_t itf, uint8_t *buffer, uint32_t 
 }
 extern void tud_vendor_tx_cb(uint8_t itf, uint32_t sent_bytes);
 extern uint32_t tud_vendor_n_write(uint8_t itf, const uint8_t *buffer, uint32_t n);
-static inline uint32_t tud_vendor_n_flush(uint8_t itf) {
+static inline uint32_t tud_vendor_n_write_flush(uint8_t itf) {
     (void) itf;
     return emul_tx_size;
 }

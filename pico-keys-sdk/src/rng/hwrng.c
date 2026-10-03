@@ -15,46 +15,41 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include <stdint.h>
-#include <string.h>
-#include <stdio.h>
+#include "picokeys.h"
+#include "hwrng.h"
+#include "pico_time.h"
 
 #if defined(PICO_PLATFORM)
-#include "pico/stdlib.h"
-#include "hwrng.h"
-#include "bsp/board.h"
 #include "pico/rand.h"
+#include "pico/mutex.h"
 #elif defined(ESP_PLATFORM)
 #include "bootloader_random.h"
 #include "esp_random.h"
-#include "esp_compat.h"
+#include "compat/esp_compat.h"
 #else
-#include <stdbool.h>
-#include <stdlib.h>
-#include <time.h>
-#include "board.h"
+#include "compat/queue.h"
 #endif
 
-void hwrng_start() {
+static void hwrng_start(void) {
 #if defined(ENABLE_EMULATION)
-    srand(time(0));
+    srand((unsigned int)time(NULL));
 #elif defined(ESP_PLATFORM)
     bootloader_random_enable();
 #endif
 }
 
 static uint64_t random_word = 0xcbf29ce484222325;
-static uint8_t ep_round = 0;
+static uint8_t hwrng_mix_round = 0;
 
-static void ep_init() {
+static void hwrng_mix_init(void) {
     random_word = 0xcbf29ce484222325;
-    ep_round = 0;
+    hwrng_mix_round = 0;
 }
 
 /* Here, we assume a little endian architecture.  */
-static int ep_process() {
-    if (ep_round == 0) {
-        ep_init();
+static int hwrng_mix_process(void) {
+    if (hwrng_mix_round == 0) {
+        hwrng_mix_init();
     }
     uint64_t word = 0x0;
 
@@ -69,119 +64,182 @@ static int ep_process() {
 #endif
     random_word ^= word ^ board_millis();
     random_word *= 0x00000100000001B3;
-    if (++ep_round == 8) {
-        ep_round = 0;
-        return 2; //2 words
+    if (++hwrng_mix_round == 8) {
+        hwrng_mix_round = 0;
+        return sizeof(uint64_t) / sizeof(uint32_t); //2 words
     }
     return 0;
 }
 
-struct rng_rb {
-    uint32_t *buf;
-    uint8_t head, tail;
-    uint8_t size;
-    unsigned int full : 1;
-    unsigned int empty : 1;
-};
+typedef struct hwrng_buf {
+    uint8_t *buf;
+    size_t head;
+    size_t tail;
+    size_t size;
+    size_t count;
+} hwrng_buf_t;
 
-static void rb_init(struct rng_rb *rb, uint32_t *p, uint8_t size) {
-    rb->buf = p;
-    rb->size = size;
+static mutex_t hwrng_mutex;
+static bool hwrng_mutex_initialized = false;
+
+static inline void hwrng_lock(void) {
+    if (hwrng_mutex_initialized) {
+        mutex_enter_blocking(&hwrng_mutex);
+    }
+}
+
+static inline void hwrng_unlock(void) {
+    if (hwrng_mutex_initialized) {
+        mutex_exit(&hwrng_mutex);
+    }
+}
+
+static void hwrng_buf_init(struct hwrng_buf *rb, byte_array_t buffer) {
+    rb->buf = buffer.data;
+    rb->size = buffer.len;
     rb->head = rb->tail = 0;
-    rb->full = 0;
-    rb->empty = 1;
+    rb->count = 0;
 }
 
-static void rb_add(struct rng_rb *rb, uint32_t v) {
-    rb->buf[rb->tail++] = v;
-    if (rb->tail == rb->size) {
-        rb->tail = 0;
+static size_t hwrng_buf_add(struct hwrng_buf *rb, const_byte_array_t data) {
+    size_t room = rb->size - rb->count;
+    size_t n = data.len < room ? data.len : room;
+    size_t tail = rb->tail;
+    size_t first = n;
+
+    if (first > rb->size - tail) {
+        first = rb->size - tail;
     }
-    if (rb->tail == rb->head) {
-        rb->full = 1;
-    }
-    rb->empty = 0;
-}
-
-static uint32_t rb_del(struct rng_rb *rb) {
-    uint32_t v = rb->buf[rb->head++];
-
-    if (rb->head == rb->size) {
-        rb->head = 0;
-    }
-    if (rb->head == rb->tail) {
-        rb->empty = 1;
-    }
-    rb->full = 0;
-
-    return v;
-}
-
-static struct rng_rb the_ring_buffer;
-
-void *neug_task() {
-    struct rng_rb *rb = &the_ring_buffer;
-
-    int n;
-
-    if ((n = ep_process())) {
-        int i;
-        const uint32_t *vp = (const uint32_t *) &random_word;
-
-        for (i = 0; i < n; i++) {
-            rb_add(rb, *vp++);
-            if (rb->full) {
-                break;
-            }
+    if (first) {
+        memcpy(rb->buf + tail, data.data, first);
+        tail += first;
+        if (tail >= rb->size) {
+            tail = 0;
         }
     }
+    if (n > first) {
+        size_t second = n - first;
+        memcpy(rb->buf + tail, data.data + first, second);
+        tail += second;
+    }
+    rb->tail = tail;
+    rb->count += n;
+    return n;
+}
+
+static size_t hwrng_buf_del(struct hwrng_buf *rb, byte_array_t data) {
+    size_t n = data.len < rb->count ? data.len : rb->count;
+    size_t head = rb->head;
+    size_t first = n;
+
+    if (first > rb->size - head) {
+        first = rb->size - head;
+    }
+    if (first) {
+        memcpy(data.data, rb->buf + head, first);
+        head += first;
+        if (head >= rb->size) {
+            head = 0;
+        }
+    }
+    if (n > first) {
+        size_t second = n - first;
+        memcpy(data.data + first, rb->buf + head, second);
+        head += second;
+    }
+    rb->head = head;
+    rb->count -= n;
+    return n;
+}
+
+static inline size_t hwrng_buf_space(const struct hwrng_buf *rb) {
+    return rb->size - rb->count;
+}
+
+static inline bool hwrng_buf_full(const struct hwrng_buf *rb) {
+    return rb->count == rb->size;
+}
+
+static struct hwrng_buf ring_buffer;
+
+void *hwrng_task(void) {
+    struct hwrng_buf *rb = &ring_buffer;
+
+    hwrng_lock();
+    if (hwrng_buf_space(rb) >= sizeof(random_word) && hwrng_mix_process()) {
+        hwrng_buf_add(rb, CONST_BYTE_ARRAY((const uint8_t *)&random_word, sizeof(random_word)));
+    }
+    hwrng_unlock();
     return NULL;
 }
 
-void neug_init(uint32_t *buf, uint8_t size) {
-    struct rng_rb *rb = &the_ring_buffer;
+void hwrng_init(byte_array_t buffer) {
+    struct hwrng_buf *rb = &ring_buffer;
 
-    rb_init(rb, buf, size);
+    mutex_init(&hwrng_mutex);
+    hwrng_mutex_initialized = true;
+    hwrng_buf_init(rb, buffer);
 
     hwrng_start();
 
-    ep_init();
+    hwrng_mix_init();
 }
 
-void neug_flush(void) {
-    struct rng_rb *rb = &the_ring_buffer;
+size_t hwrng_read(byte_array_t buffer) {
+    struct hwrng_buf *rb = &ring_buffer;
+    size_t n;
 
-    while (!rb->empty) {
-        rb_del(rb);
-    }
+    hwrng_lock();
+    n = hwrng_buf_del(rb, buffer);
+    hwrng_unlock();
+    return n;
 }
 
-uint32_t neug_get() {
-    struct rng_rb *rb = &the_ring_buffer;
-    uint32_t v;
+void hwrng_flush(void) {
+    struct hwrng_buf *rb = &ring_buffer;
+    hwrng_lock();
+    rb->head = 0;
+    rb->tail = 0;
+    rb->count = 0;
+    hwrng_unlock();
+}
 
-    while (rb->empty) {
-        neug_task();
+uint32_t hwrng_get(void) {
+    uint32_t v = 0;
+    size_t offset = 0;
+
+    while (offset < sizeof(v)) {
+        size_t n = hwrng_read(BYTE_ARRAY(((uint8_t *)&v) + offset, sizeof(v) - offset));
+        if (n == 0) {
+            hwrng_task();
+            continue;
+        }
+        offset += n;
     }
-    v = rb_del(rb);
 
     return v;
 }
 
-void neug_wait_full() {
-    struct rng_rb *rb = &the_ring_buffer;
+void hwrng_wait_full(void) {
+    struct hwrng_buf *rb = &ring_buffer;
 #ifdef ESP_PLATFORM
     uint8_t core = xTaskGetCurrentTaskHandle() == hcore1 ? 1 : 0;
 #elif defined(PICO_PLATFORM)
     uint core = get_core_num();
 #endif
-    while (!rb->full) {
+    while (true) {
+        hwrng_lock();
+        bool full = hwrng_buf_full(rb);
+        hwrng_unlock();
+        if (full) {
+            break;
+        }
 #if defined(PICO_PLATFORM) || defined(ESP_PLATFORM)
         if (core == 1) {
             sleep_ms(1);
         }
         else
 #endif
-        neug_task();
+        hwrng_task();
     }
 }

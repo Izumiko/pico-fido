@@ -330,7 +330,7 @@
 //#define MBEDTLS_RSA_ALT
 //#define MBEDTLS_SHA1_ALT
 #ifdef PICO_RP2350
-#define MBEDTLS_SHA256_ALT
+//#define MBEDTLS_SHA256_ALT
 #endif
 //#define MBEDTLS_SHA512_ALT
 
@@ -477,7 +477,9 @@
  *
  * Uncomment to use your own hardware entropy collector.
  */
-//#define MBEDTLS_ENTROPY_HARDWARE_ALT
+#ifdef ESP_PLATFORM
+#define MBEDTLS_ENTROPY_HARDWARE_ALT
+#endif
 
 /**
  * \def MBEDTLS_AES_ROM_TABLES
@@ -1276,7 +1278,7 @@
  *
  * Enable the checkup functions (*_self_test).
  */
-#define MBEDTLS_SELF_TEST
+//#define MBEDTLS_SELF_TEST
 
 /**
  * \def MBEDTLS_SHA256_SMALLER

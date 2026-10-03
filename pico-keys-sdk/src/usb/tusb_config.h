@@ -122,6 +122,9 @@ extern "C" {
 #else
 #define CFG_TUD_VENDOR            0
 #endif
+#ifdef USB_ITF_LWIP
+#define CFG_TUD_NCM               1
+#endif
 
 // HID buffer size Should be sufficient to hold ID (if any) + Data
 #define CFG_TUD_HID_EP_BUFSIZE    64

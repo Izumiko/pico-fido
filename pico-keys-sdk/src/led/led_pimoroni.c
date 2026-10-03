@@ -15,9 +15,11 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include "pico_keys.h"
+#include "picokeys.h"
+#include "led/led.h"
 
 #ifdef PICO_PLATFORM
+#include "hardware/gpio.h"
 #ifdef PICO_DEFAULT_LED_PIN
 static uint8_t gpio = PICO_DEFAULT_LED_PIN;
 #else
@@ -35,7 +37,7 @@ uint8_t pixel[][3] = {
     {0, 0, 0}  // 7: white
 };
 
-void led_driver_init_pimoroni() {
+static void led_driver_init_pimoroni(void) {
     if (phy_data.led_gpio_present) {
         gpio = phy_data.led_gpio;
     }
@@ -47,7 +49,8 @@ void led_driver_init_pimoroni() {
     gpio_set_dir(gpio+1, GPIO_OUT);
 }
 
-void led_driver_color_pimoroni(uint8_t color, uint32_t led_brightness, float progress) {
+static void led_driver_color_pimoroni(uint8_t color, uint32_t led_brightness, float progress) {
+    (void)led_brightness;
     if (progress < 0.5) {
         color = LED_COLOR_OFF;
     }

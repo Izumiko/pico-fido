@@ -15,13 +15,33 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include "pico_keys.h"
+#include "picokeys.h"
 #include "fido.h"
+#include "ctap2_cbor.h"
 #include "ctap.h"
+#include "button.h"
+#include "event.h"
 
-int cbor_selection() {
-    if (wait_button_pressed() == true) {
+extern char *rp_id, *user_name, *display_name;
+extern size_t rp_id_len;
+extern uint8_t current_fido_operation;
+
+int cbor_selection(void) {
+    rp_id = user_name = display_name = NULL;
+    rp_id_len = 0;
+    current_fido_operation = OP_NONE;
+    /* authenticatorSelection always requires a user-presence interaction. */
+    bool previous_force_button_wait = force_button_wait;
+#ifdef FORCE_BUTTON_WAIT
+    force_button_wait = true;
+#endif
+    int ret = wait_button_pressed();
+    force_button_wait = previous_force_button_wait;
+    if (ret == 1) {
         return CTAP2_ERR_USER_ACTION_TIMEOUT;
+    }
+    else if (ret == 2) {
+        return CTAP2_ERR_OPERATION_DENIED;
     }
     return CTAP2_OK;
 }

@@ -4,7 +4,9 @@ This project transforms your Raspberry Pi Pico or ESP32 microcontroller into an 
 ## Features
 Pico FIDO includes the following features:
 
-- CTAP 2.1 / CTAP 1
+- CTAP 2.3 / CTAP 1
+- Authenticated passkey export and import through the open-source Pico Vault
+- FIDO 2.3 extensions, including UVM, third-party payments, and PIN complexity policy
 - WebAuthn
 - U2F
 - HMAC-Secret extension
@@ -12,6 +14,8 @@ Pico FIDO includes the following features:
 - User presence enforcement through physical button
 - User verification with PIN
 - Discoverable credentials (resident keys)
+- Configurable policy to deny creation of resident/discoverable credentials
+- Credential expiration and revocation metadata
 - Credential management
 - ECDSA and EDDSA authentication
 - Support for SECP256R1, SECP384R1, SECP521R1, SECP256K1 and Ed25519 curves
@@ -34,12 +38,19 @@ Pico FIDO includes the following features:
 - Challenge-response generation
 - Emulated keyboard interface
 - Button press generates an OTP that is directly typed
+- Yubico Authenticator app compatible
 - Yubico YKMAN compatible
 - Nitrokey nitropy and nitroapp compatible
 - Secure Boot and Secure Lock in RP2350 and ESP32-S3 MCUs
 - One Time Programming to store the master key that encrypts all resident keys and seeds.
 - Rescue interface to allow recovery of the device if it becomes unresponsive or undetectable.
-- LED customization with Pico Commissioner.
+- LED customization with PicoKey App.
+
+The authenticated credential export and import design is described in Pol
+Henarejos, [*Vaulted Passkeys: A Device-Bound Proposal for Authenticated
+Credential Export and Import*](https://arxiv.org/abs/2608.13806). The proposal
+and implementation notes are also available in
+[`docs/vault`](docs/vault/vaulted_passkeys_proposal.md).
 
 All features comply with the specifications. If you encounter unexpected behavior or deviations from the specifications, please open an issue.
 
@@ -53,11 +64,11 @@ Microcontrollers RP2350 and ESP32-S3 are designed to support secure environments
 
 If you own a Raspberry Pico (RP2040 or RP2350), go to [Download page](https://www.picokeys.com/getting-started/), select your vendor and model and download the proper firmware; or go to [Release page](https://www.github.com/polhenarejos/pico-fido/releases/) and download the UF2 file for your board.
 
-Note that UF2 files are shiped with a dummy VID/PID to avoid license issues (FEFF:FCFD). If you plan to use it with other proprietary tools, you should modify Info.plist of CCID driver to add these VID/PID or use the [Pico Commissioner](https://www.picokeys.com/pico-commissioner/ "Pico Commissioner").
+UF2 files are shiped with a VID/PID granted by RaspberryPi (2E8A:10FE). If you plan to use it with OpenSC or similar tools, you should modify Info.plist of CCID driver to add these VID/PID or use the [PicoKey App](https://www.picokeys.com/picokeyapp/ "PicoKey App").
 
-You can use whatever VID/PID (i.e., 234b:0000 from FISJ), but remember that you are not authorized to distribute the binary with a VID/PID that you do not own.
+You can use whatever VID/PID for internal purposes, but remember that you are not authorized to distribute the binary with a VID/PID that you do not own.
 
-Note that the pure-browser option [Pico Commissioner](https://www.picokeys.com/pico-commissioner/ "Pico Commissioner") is the most recommended.
+Note that the [PicoKey App](https://www.picokeys.com/picokeyapp/ "PicoKey App") is the most recommended.
 
 ## Build for Raspberry Pico
 Before building, ensure you have installed the toolchain for the Pico and that the Pico SDK is properly located on your drive.

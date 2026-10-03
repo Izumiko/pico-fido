@@ -15,7 +15,11 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include "pico_keys.h"
+#include "picokeys.h"
+#include "led/led.h"
+#ifdef PICO_PLATFORM
+#include "hardware/gpio.h"
+#endif
 
 #ifdef ESP_PLATFORM
 
@@ -35,6 +39,24 @@ tNeopixel pixel[] = {
     { 0, NP_RGB(255, 255,  255) }, /* white */
 };
 
+static inline uint32_t neopixel_rgb_ordered(uint8_t r, uint8_t g, uint8_t b) {
+    switch (phy_data.led_order) {
+        case PHY_LED_ORDER_RBG:
+            return NP_RGB(r, b, g);
+        case PHY_LED_ORDER_GRB:
+            return NP_RGB(g, r, b);
+        case PHY_LED_ORDER_GBR:
+            return NP_RGB(g, b, r);
+        case PHY_LED_ORDER_BRG:
+            return NP_RGB(b, r, g);
+        case PHY_LED_ORDER_BGR:
+            return NP_RGB(b, g, r);
+        case PHY_LED_ORDER_RGB:
+        default:
+            return NP_RGB(r, g, b);
+    }
+}
+
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
     #define NEOPIXEL_PIN GPIO_NUM_48
 #elif defined(CONFIG_IDF_TARGET_ESP32S2)
@@ -45,7 +67,7 @@ tNeopixel pixel[] = {
     #define NEOPIXEL_PIN GPIO_NUM_27
 #endif
 
-void led_driver_init_neopixel() {
+void led_driver_init_neopixel(void) {
     uint8_t gpio = NEOPIXEL_PIN;
     if (phy_data.led_gpio_present) {
         gpio = phy_data.led_gpio;
@@ -68,7 +90,7 @@ void led_driver_color_neopixel(uint8_t color, uint32_t led_brightness, float pro
     r = (uint8_t)(r * brightness);
     g = (uint8_t)(g * brightness);
     b = (uint8_t)(b * brightness);
-    spx.rgb = NP_RGB(r, g, b);
+    spx.rgb = neopixel_rgb_ordered(r, g, b);
     neopixel_SetPixel(neopixel, &spx, 1);
 }
 

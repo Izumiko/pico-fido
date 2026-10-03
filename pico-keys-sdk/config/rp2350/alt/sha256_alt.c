@@ -3,16 +3,16 @@
  * Copyright (c) 2022 Pol Henarejos.
  *
  * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
+ * it under the terms of the GNU Affero General Public License as published by
  * the Free Software Foundation, version 3.
  *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
- * General Public License for more details.
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "common.h"
@@ -75,6 +75,7 @@ void mbedtls_sha256_free(mbedtls_sha256_context *ctx) {
         return;
     }
 
+    pico_sha256_cleanup(&ctx->pico_state);
     mbedtls_platform_zeroize(ctx, sizeof(mbedtls_sha256_context));
 }
 
@@ -285,4 +286,10 @@ int mbedtls_sha256_finish(mbedtls_sha256_context *ctx, unsigned char *output) {
         memcpy(output, result.bytes, 32);
     }
     return 0;
+}
+
+void mbedtls_sha256_clone(mbedtls_sha256_context *dst,
+                          const mbedtls_sha256_context *src)
+{
+    *dst = *src;
 }

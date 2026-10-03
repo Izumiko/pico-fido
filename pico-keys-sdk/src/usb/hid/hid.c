@@ -15,26 +15,30 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include "pico_keys.h"
+#include <stdio.h>
+#include "picokeys.h"
+#include "serial.h"
+#include "pico_time.h"
 #ifndef ENABLE_EMULATION
 #include "tusb.h"
-#if defined(PICO_PLATFORM)
-#include "bsp/board.h"
-#elif defined(ESP_PLATFORM)
+#if defined(ESP_PLATFORM)
 static portMUX_TYPE mutex = portMUX_INITIALIZER_UNLOCKED;
 #endif
 #else
 #include "emulation.h"
 #endif
 #include "ctap_hid.h"
-#include "pico_keys_version.h"
+#include "picokeys_version.h"
 #include "apdu.h"
 #include "usb.h"
+#include "button.h"
 
-extern void init_fido();
+extern void init_fido(void);
 bool is_nk = false;
-uint8_t (*get_version_major)() = NULL;
-uint8_t (*get_version_minor)() = NULL;
+uint8_t (*get_version_major)(void) = NULL;
+uint8_t (*get_version_minor)(void) = NULL;
+
+#define CTAPHID_KEEPALIVE_CANCEL_STATUS 0x2D
 
 static usb_buffer_t *hid_rx = NULL, *hid_tx = NULL;
 
@@ -51,12 +55,18 @@ static uint16_t *send_buffer_size = NULL;
 static write_status_t *last_write_result = NULL;
 
 CTAPHID_FRAME *ctap_req = NULL, *ctap_resp = NULL;
-void send_keepalive();
+static void send_keepalive(void);
 int driver_process_usb_packet_hid(uint16_t read);
-int driver_write_hid(uint8_t itf, const uint8_t *buffer, uint16_t buffer_size);
-int driver_process_usb_nopacket_hid();
+int driver_write_hid(uint8_t itf, const_byte_array_t buffer);
+static int driver_process_usb_nopacket_hid(void);
+void hid_init(void);
+void hid_task(void);
+#ifdef ENABLE_EMULATION
+uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t *buffer, uint16_t reqlen);
+void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize);
+#endif
 
-void hid_init() {
+void hid_init(void) {
     if (ITF_HID_TOTAL == 0) {
         return;
     }
@@ -74,11 +84,20 @@ void hid_init() {
     }
 }
 
-int driver_init_hid() {
+int driver_init_hid(void) {
 #ifndef ENABLE_EMULATION
     static bool _init = false;
     if (_init == false) {
+#if defined(ESP_PLATFORM)
+        const tusb_rhport_init_t rh_init = {
+            .role = TUSB_ROLE_DEVICE,
+            .speed = TUSB_SPEED_AUTO,
+        };
+
+        tusb_init(BOARD_TUD_RHPORT, &rh_init);
+#else
         tud_init(BOARD_TUD_RHPORT);
+#endif
         _init = true;
     }
 #endif
@@ -96,10 +115,6 @@ int driver_init_hid() {
     hid_tx[ITF_HID_CTAP].w_ptr = hid_tx[ITF_HID_CTAP].r_ptr = 0;
     send_buffer_size[ITF_HID_CTAP] = 0;
     return 0;
-}
-
-uint16_t *get_send_buffer_size(uint8_t itf) {
-    return &send_buffer_size[itf];
 }
 
 //--------------------------------------------------------------------+
@@ -127,7 +142,7 @@ uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t
     return reqlen;
 }
 
-uint32_t hid_write_offset(uint16_t size, uint16_t offset) {
+static uint32_t hid_write_offset(uint16_t size, uint16_t offset) {
     if (hid_tx[ITF_HID_CTAP].buffer[offset] != 0x81) {
         DEBUG_PAYLOAD(&hid_tx[ITF_HID_CTAP].buffer[offset], size);
     }
@@ -136,7 +151,7 @@ uint32_t hid_write_offset(uint16_t size, uint16_t offset) {
     return size;
 }
 
-uint32_t hid_write(uint16_t size) {
+static uint32_t hid_write(uint16_t size) {
     return hid_write_offset(size, 0);
 }
 
@@ -148,16 +163,16 @@ static uint8_t keyboard_w = 0;
 static bool sent_key = false;
 static bool keyboard_encode = false;
 
-void add_keyboard_buffer(const uint8_t *data, size_t data_len, bool encode) {
-    keyboard_buffer_len = (uint8_t)MIN(sizeof(keyboard_buffer), data_len);
-    memcpy(keyboard_buffer, data, keyboard_buffer_len);
+void add_keyboard_buffer(const_byte_array_t data, bool encode) {
+    keyboard_buffer_len = (uint8_t)MIN(sizeof(keyboard_buffer), data.len);
+    memcpy(keyboard_buffer, data.data, keyboard_buffer_len);
     keyboard_encode = encode;
 }
 
-void append_keyboard_buffer(const uint8_t *data, size_t data_len) {
-    if (keyboard_buffer_len + data_len < sizeof(keyboard_buffer)) {
-        memcpy(keyboard_buffer + keyboard_buffer_len, data, MIN(sizeof(keyboard_buffer) - keyboard_buffer_len, data_len));
-        keyboard_buffer_len += (uint8_t)MIN(sizeof(keyboard_buffer) - keyboard_buffer_len, data_len);
+void append_keyboard_buffer(const_byte_array_t data) {
+    if (keyboard_buffer_len + data.len < sizeof(keyboard_buffer)) {
+        memcpy(keyboard_buffer + keyboard_buffer_len, data.data, MIN(sizeof(keyboard_buffer) - keyboard_buffer_len, data.len));
+        keyboard_buffer_len += (uint8_t)MIN(sizeof(keyboard_buffer) - keyboard_buffer_len, data.len);
     }
 }
 
@@ -210,7 +225,7 @@ static void send_hid_report(uint8_t report_id) {
 
 void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_t len) {
     //printf("report_complete %d %d %d\n", instance, len, send_buffer_size[instance]);
-    if (instance == ITF_HID_CTAP && len > 0) {
+    if (instance == ITF_HID_CTAP && len == 64) {
 #ifdef ESP_PLATFORM
         taskENTER_CRITICAL(&mutex);
 #endif
@@ -250,19 +265,23 @@ void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_
     }
 }
 
-int driver_write_hid(uint8_t itf, const uint8_t *buffer, uint16_t buffer_size) {
+int driver_write_hid(uint8_t itf, const_byte_array_t buffer) {
+    if ((!buffer.data && buffer.len > 0) || buffer.len > UINT16_MAX) {
+        return 0;
+    }
+    uint16_t buffer_len = (uint16_t)buffer.len;
     if (last_write_result[itf] == WRITE_PENDING) {
         return 0;
     }
-    bool r = tud_hid_n_report(itf, 0, buffer, buffer_size);
+    bool r = tud_hid_n_report(itf, 0, buffer.data, buffer_len);
     last_write_result[itf] = r ? WRITE_PENDING : WRITE_FAILED;
     if (last_write_result[itf] == WRITE_FAILED) {
         return 0;
     }
 #ifdef ENABLE_EMULATION
-    tud_hid_report_complete_cb(ITF_HID_CTAP, buffer, buffer_size);
+    tud_hid_report_complete_cb(ITF_HID_CTAP, buffer.data, buffer_len);
 #endif
-    return MIN(64, buffer_size);
+    return buffer_len > 64 ? 64 : buffer_len;
 }
 
 int (*hid_set_report_cb)(uint8_t, uint8_t, hid_report_type_t, uint8_t const *, uint16_t) = NULL;
@@ -278,9 +297,12 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
     if (!hid_set_report_cb || hid_set_report_cb(itf, report_id, report_type, buffer, bufsize) == 0) {
         //usb_rx(itf, buffer, bufsize);
         if (itf == ITF_HID_CTAP) {
+            if (bufsize != HID_RPT_SIZE) {
+                return;
+            }
             memcpy(hid_rx[itf].buffer + hid_rx[itf].w_ptr, buffer, bufsize);
             hid_rx[itf].w_ptr += bufsize;
-            int proc_pkt = driver_process_usb_packet_hid(64);
+            int proc_pkt = driver_process_usb_packet_hid(bufsize);
             if (proc_pkt == 0) {
                 driver_process_usb_nopacket_hid();
             }
@@ -304,12 +326,25 @@ uint8_t last_cmd = 0;
 uint8_t last_seq = 0;
 CTAPHID_FRAME last_req = { 0 };
 uint32_t lock = 0;
+uint32_t lock_cid = 0;
+static uint32_t next_cid = 1;
+
+static uint32_t allocate_cid(void) {
+    uint32_t cid;
+    do {
+        cid = next_cid++;
+        if (next_cid == 0 || next_cid == CID_BROADCAST) {
+            next_cid = 1;
+        }
+    } while (cid == 0 || cid == CID_BROADCAST);
+    return cid;
+}
 
 uint8_t thread_type = 0; //1 is APDU, 2 is CBOR
-extern bool cancel_button;
 extern int cbor_process(uint8_t last_cmd, const uint8_t *data, size_t len);
+static uint32_t last_keepalive_time = 0;
 
-int driver_process_usb_nopacket_hid() {
+int driver_process_usb_nopacket_hid(void) {
     if (last_packet_time > 0 && last_packet_time + 500 < board_millis()) {
         ctap_error(CTAP1_ERR_MSG_TIMEOUT);
         last_packet_time = 0;
@@ -321,24 +356,54 @@ int driver_process_usb_nopacket_hid() {
 extern const uint8_t fido_aid[], u2f_aid[], oath_aid[];
 extern void *cbor_thread(void *);
 
+uint16_t *get_send_buffer_size(uint8_t itf) {
+    return &send_buffer_size[itf];
+}
+
 int driver_process_usb_packet_hid(uint16_t read) {
     int apdu_sent = 0;
-    if (read >= 5) {
+    if (read == HID_RPT_SIZE) {
         driver_init_hid();
 
-        hid_rx[ITF_HID_CTAP].r_ptr += 64;
+        hid_rx[ITF_HID_CTAP].r_ptr += HID_RPT_SIZE;
         if (hid_rx[ITF_HID_CTAP].r_ptr >= hid_rx[ITF_HID_CTAP].w_ptr) {
             hid_rx[ITF_HID_CTAP].r_ptr = hid_rx[ITF_HID_CTAP].w_ptr = 0;
         }
         last_packet_time = board_millis();
-        DEBUG_PAYLOAD((uint8_t *)ctap_req, 64);
+        DEBUG_PAYLOAD((uint8_t *)ctap_req, HID_RPT_SIZE);
+        if (FRAME_TYPE(ctap_req) == TYPE_CONT && msg_packet.len == 0) {
+            last_packet_time = 0;
+            return 0;
+        }
         if (ctap_req->cid == 0x0 ||
             (ctap_req->cid == CID_BROADCAST && (FRAME_TYPE(ctap_req) != TYPE_INIT || ctap_req->init.cmd != CTAPHID_INIT))) {
             return ctap_error(CTAP1_ERR_INVALID_CHANNEL);
         }
-        if (board_millis() < lock && ctap_req->cid != last_req.cid &&
-            last_cmd_time + 100 > board_millis()) {
+        if (board_millis() < lock && ctap_req->cid != lock_cid &&
+            !(ctap_req->cid == CID_BROADCAST && ctap_req->init.cmd == CTAPHID_INIT)) {
             return ctap_error(CTAP1_ERR_CHANNEL_BUSY);
+        }
+        if (FRAME_TYPE(ctap_req) == TYPE_INIT && ctap_req->init.cmd == CTAPHID_CANCEL) {
+            bool active_transaction = is_busy();
+            msg_packet.len = msg_packet.current_len = 0;
+            last_packet_time = 0;
+            cancel_button = true;
+            res_APDU_size = 0;
+            hid_tx[ITF_HID_CTAP].r_ptr = hid_tx[ITF_HID_CTAP].w_ptr = 0;
+            send_buffer_size[ITF_HID_CTAP] = 0;
+            if (active_transaction && last_cmd == CTAPHID_CBOR) {
+                finished_data_size = 0;
+                apdu.sw = 0;
+                apdu.rlen = 0;
+                memset((uint8_t *)ctap_resp, 0, sizeof(CTAPHID_FRAME));
+                ctap_resp->cid = ctap_req->cid;
+                ctap_resp->init.cmd = CTAPHID_CBOR;
+                ctap_resp->init.bcntl = 1;
+                ctap_resp->init.data[0] = CTAPHID_KEEPALIVE_CANCEL_STATUS;
+                hid_write(64);
+                timeout_stop();
+            }
+            return 0;
         }
         if (FRAME_TYPE(ctap_req) == TYPE_INIT) {
             if (MSG_LEN(ctap_req) > CTAP_MAX_PACKET_SIZE) {
@@ -367,9 +432,6 @@ int driver_process_usb_packet_hid(uint16_t read) {
             last_cmd_time = board_millis();
         }
         else {
-            if (msg_packet.len == 0) { //Received a cont with a prior init pkt
-                return 0;
-            }
             if (last_seq != ctap_req->cont.seq) {
                 return ctap_error(CTAP1_ERR_INVALID_SEQ);
             }
@@ -391,17 +453,17 @@ int driver_process_usb_packet_hid(uint16_t read) {
             CTAPHID_INIT_REQ *req = (CTAPHID_INIT_REQ *) ctap_req->init.data;
             CTAPHID_INIT_RESP *resp = (CTAPHID_INIT_RESP *) ctap_resp->init.data;
             memcpy(resp->nonce, req->nonce, sizeof(resp->nonce));
-            resp->cid = 0x01000000;
+            resp->cid = ctap_req->cid == CID_BROADCAST ? allocate_cid() : ctap_req->cid;
             resp->versionInterface = CTAPHID_IF_VERSION;
-            resp->versionMajor = get_version_major ? get_version_major() : PICO_KEYS_SDK_VERSION_MAJOR;
-            resp->versionMinor = get_version_minor ? get_version_minor() : PICO_KEYS_SDK_VERSION_MINOR;
+            resp->versionMajor = get_version_major ? get_version_major() : PICOKEYS_SDK_VERSION_MAJOR;
+            resp->versionMinor = get_version_minor ? get_version_minor() : PICOKEYS_SDK_VERSION_MINOR;
             resp->capFlags = CAPFLAG_WINK | CAPFLAG_CBOR;
 
             ctap_resp->cid = ctap_req->cid;
             ctap_resp->init.cmd = CTAPHID_INIT;
             ctap_resp->init.bcntl = 17;
             ctap_resp->init.bcnth = 0;
-            driver_write_hid(ITF_HID_CTAP, (const uint8_t *)ctap_resp, 64);
+            driver_write_hid(ITF_HID_CTAP, CONST_BYTE_ARRAY((const uint8_t *)ctap_resp, 64));
             msg_packet.len = msg_packet.current_len = 0;
             last_packet_time = 0;
         }
@@ -414,7 +476,7 @@ int driver_process_usb_packet_hid(uint16_t read) {
 #if defined(PICO_PLATFORM) || defined(ESP_PLATFORM)
             sleep_ms(1000); //For blinking the device during 1 seg
 #endif
-            driver_write_hid(ITF_HID_CTAP, (const uint8_t *)ctap_resp, 64);
+            driver_write_hid(ITF_HID_CTAP, CONST_BYTE_ARRAY((const uint8_t *)ctap_resp, 64));
             msg_packet.len = msg_packet.current_len = 0;
         }
         else if ((last_cmd == CTAPHID_PING || last_cmd == CTAPHID_SYNC) &&
@@ -430,7 +492,7 @@ int driver_process_usb_packet_hid(uint16_t read) {
                 ctap_resp->init.cmd = last_cmd;
                 ctap_resp->init.bcnth = MSG_LEN(ctap_req) >> 8;
                 ctap_resp->init.bcntl = MSG_LEN(ctap_req) & 0xff;
-                driver_write_hid(ITF_HID_CTAP, (const uint8_t *)ctap_resp, 64);
+                driver_write_hid(ITF_HID_CTAP, CONST_BYTE_ARRAY((const uint8_t *)ctap_resp, 64));
             }
             msg_packet.len = msg_packet.current_len = 0;
             last_packet_time = 0;
@@ -442,10 +504,20 @@ int driver_process_usb_packet_hid(uint16_t read) {
             if (ctap_req->init.data[0] > 10) {
                 return ctap_error(CTAP1_ERR_INVALID_PARAMETER);
             }
-            lock = board_millis() + ctap_req->init.data[0] * 1000;
+            if (board_millis() < lock && ctap_req->cid != lock_cid) {
+                return ctap_error(CTAP1_ERR_CHANNEL_BUSY);
+            }
+            if (ctap_req->init.data[0] == 0) {
+                lock = 0;
+                lock_cid = 0;
+            }
+            else {
+                lock = board_millis() + ctap_req->init.data[0] * 1000;
+                lock_cid = ctap_req->cid;
+            }
             ctap_resp->cid = ctap_req->cid;
             ctap_resp->init.cmd = ctap_req->init.cmd;
-            driver_write_hid(ITF_HID_CTAP, (const uint8_t *)ctap_resp, 64);
+            driver_write_hid(ITF_HID_CTAP, CONST_BYTE_ARRAY((const uint8_t *)ctap_resp, 64));
             msg_packet.len = msg_packet.current_len = 0;
             last_packet_time = 0;
         }
@@ -454,17 +526,17 @@ int driver_process_usb_packet_hid(uint16_t read) {
             ctap_resp->init.cmd = ctap_req->init.cmd;
             memcpy(ctap_resp->init.data, pico_serial.id, sizeof(pico_serial.id));
             ctap_resp->init.bcntl = 16;
-            driver_write_hid(ITF_HID_CTAP, (const uint8_t *)ctap_resp, 64);
+            driver_write_hid(ITF_HID_CTAP, CONST_BYTE_ARRAY((const uint8_t *)ctap_resp, 64));
             msg_packet.len = msg_packet.current_len = 0;
             last_packet_time = 0;
         }
         else if (ctap_req->init.cmd == CTAPHID_VERSION) {
             ctap_resp->cid = ctap_req->cid;
             ctap_resp->init.cmd = ctap_req->init.cmd;
-            ctap_resp->init.data[0] = PICO_KEYS_SDK_VERSION_MAJOR;
-            ctap_resp->init.data[1] = PICO_KEYS_SDK_VERSION_MINOR;
+            ctap_resp->init.data[0] = PICOKEYS_SDK_VERSION_MAJOR;
+            ctap_resp->init.data[1] = PICOKEYS_SDK_VERSION_MINOR;
             ctap_resp->init.bcntl = 4;
-            driver_write_hid(ITF_HID_CTAP, (const uint8_t *)ctap_resp, 64);
+            driver_write_hid(ITF_HID_CTAP, CONST_BYTE_ARRAY((const uint8_t *)ctap_resp, 64));
             msg_packet.len = msg_packet.current_len = 0;
             last_packet_time = 0;
         }
@@ -475,7 +547,7 @@ int driver_process_usb_packet_hid(uint16_t read) {
                 memcpy(ctap_resp->init.data, "\x00\xff\xff\xff\x00", 5);
                 ctap_resp->init.bcntl = 5;
             }
-            driver_write_hid(ITF_HID_CTAP, (const uint8_t *)ctap_resp, 64);
+            driver_write_hid(ITF_HID_CTAP, CONST_BYTE_ARRAY((const uint8_t *)ctap_resp, 64));
             msg_packet.len = msg_packet.current_len = 0;
             last_packet_time = 0;
         }
@@ -485,20 +557,20 @@ int driver_process_usb_packet_hid(uint16_t read) {
             if (last_cmd == CTAPHID_OTP) {
                 is_nk = true;
 #ifdef ENABLE_OATH_APP
-                select_app(oath_aid + 1, oath_aid[0]);
+                select_app(CONST_BYTE_ARRAY(oath_aid + 1, oath_aid[0]));
 #endif
             }
             else {
-                select_app(u2f_aid + 1, u2f_aid[0]);
+                select_app(CONST_BYTE_ARRAY(u2f_aid + 1, u2f_aid[0]));
             }
 
             thread_type = 1;
 
             if (msg_packet.current_len == msg_packet.len && msg_packet.len > 0) {
-                apdu_sent = apdu_process(ITF_HID_CTAP, msg_packet.data, msg_packet.len);
+                apdu_sent = apdu_process(ITF_HID_CTAP, CONST_BYTE_ARRAY(msg_packet.data, msg_packet.len));
             }
             else {
-                apdu_sent = apdu_process(ITF_HID_CTAP, ctap_req->init.data, MSG_LEN(ctap_req));
+                apdu_sent = apdu_process(ITF_HID_CTAP, CONST_BYTE_ARRAY(ctap_req->init.data, MSG_LEN(ctap_req)));
             }
             DEBUG_PAYLOAD(apdu.data, (int) apdu.nc);
             msg_packet.len = msg_packet.current_len = 0;
@@ -507,7 +579,8 @@ int driver_process_usb_packet_hid(uint16_t read) {
         else if ((last_cmd == CTAPHID_CBOR || last_cmd >= CTAPHID_VENDOR_FIRST) &&
                  (msg_packet.len == 0 || (msg_packet.len == msg_packet.current_len && msg_packet.len > 0))) {
             thread_type = 2;
-            select_app(fido_aid + 1, fido_aid[0]);
+            cancel_button = false;
+            select_app(CONST_BYTE_ARRAY(fido_aid + 1, fido_aid[0]));
             if (msg_packet.current_len == msg_packet.len && msg_packet.len > 0) {
                 apdu_sent = cbor_process(last_cmd, msg_packet.data, msg_packet.len);
             }
@@ -519,14 +592,8 @@ int driver_process_usb_packet_hid(uint16_t read) {
             if (apdu_sent < 0) {
                 return ctap_error((uint8_t)(-apdu_sent));
             }
+            last_keepalive_time = 0;
             send_keepalive();
-        }
-        else if (ctap_req->init.cmd == CTAPHID_CANCEL) {
-            ctap_error(0x2D);
-            msg_packet.len = msg_packet.current_len = 0;
-            last_packet_time = 0;
-            cancel_button = true;
-            hid_tx[ITF_HID_CTAP].r_ptr = hid_tx[ITF_HID_CTAP].w_ptr = 0;
         }
         else {
             if (msg_packet.len == 0) {
@@ -549,8 +616,12 @@ int driver_process_usb_packet_hid(uint16_t read) {
     return apdu_sent;
 }
 
-void send_keepalive() {
-    if (thread_type == 1) {
+static void send_keepalive(void) {
+    if (thread_type == 1 || cancel_button) {
+        return;
+    }
+    uint32_t now = board_millis();
+    if (last_keepalive_time != 0 && now - last_keepalive_time < 250) {
         return;
     }
     CTAPHID_FRAME *resp = (CTAPHID_FRAME *) (hid_tx[ITF_HID_CTAP].buffer + sizeof(hid_tx[ITF_HID_CTAP].buffer) - 64);
@@ -560,7 +631,9 @@ void send_keepalive() {
     resp->init.bcntl = 1;
     resp->init.data[0] = is_req_button_pending() ? 2 : 1;
     //send_buffer_size[ITF_HID_CTAP] = 0;
-    driver_write_hid(ITF_HID_CTAP, (const uint8_t *)resp, 64);
+    if (driver_write_hid(ITF_HID_CTAP, CONST_BYTE_ARRAY((const uint8_t *)resp, 64)) > 0) {
+        last_keepalive_time = now;
+    }
 }
 
 void driver_exec_finished_hid(uint16_t size_next) {
@@ -571,7 +644,7 @@ void driver_exec_finished_hid(uint16_t size_next) {
         else {
             if (is_nk) {
                 memmove(apdu.rdata + 2, apdu.rdata, size_next - 2);
-                put_uint16_t_be(apdu.sw, apdu.rdata);
+                put_uint16_be(apdu.sw, apdu.rdata);
             }
             driver_exec_finished_cont_hid(ITF_HID_CTAP, size_next, 7);
         }
@@ -593,7 +666,9 @@ void driver_exec_finished_cont_hid(uint8_t itf, uint16_t size_next, uint16_t off
     }
 }
 
-void hid_task() {
+void hid_task(void) {
+    const uint32_t status_poll_interval_ms = 1;
+    static uint32_t last_status_poll_ms = 0;
 #ifdef ENABLE_EMULATION
     uint16_t rx_len = emul_read(ITF_HID);
     if (rx_len) {
@@ -613,15 +688,19 @@ void hid_task() {
     if (proc_pkt == 0) {
         driver_process_usb_nopacket_hid();
     }
-    int status = card_status(ITF_HID);
-    if (status == PICOKEY_OK) {
-        driver_exec_finished_hid(finished_data_size);
-    }
-    else if (status == PICOKEY_ERR_BLOCKED) {
-        send_keepalive();
+    uint32_t now_ms = board_millis();
+    if (now_ms - last_status_poll_ms >= status_poll_interval_ms) {
+        last_status_poll_ms = now_ms;
+        int status = card_status(ITF_HID);
+        if (status == PICOKEYS_OK) {
+            driver_exec_finished_hid(finished_data_size);
+        }
+        else if (status == PICOKEYS_ERR_BLOCKED) {
+            send_keepalive();
+        }
     }
     if (hid_tx[ITF_HID_CTAP].w_ptr > hid_tx[ITF_HID_CTAP].r_ptr && last_write_result[ITF_HID_CTAP] != WRITE_PENDING) {
-        if (driver_write_hid(ITF_HID_CTAP, hid_tx[ITF_HID_CTAP].buffer + hid_tx[ITF_HID_CTAP].r_ptr, 64) > 0) {
+        if (driver_write_hid(ITF_HID_CTAP, CONST_BYTE_ARRAY(hid_tx[ITF_HID_CTAP].buffer + hid_tx[ITF_HID_CTAP].r_ptr, 64)) > 0) {
 
         }
     }

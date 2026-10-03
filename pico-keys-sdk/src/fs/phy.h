@@ -18,6 +18,8 @@
 #ifndef _PHY_H_
 #define _PHY_H_
 
+#include "byte_array.h"
+
 #define EF_PHY       0xE020
 
 #define PHY_VIDPID      0x0
@@ -51,6 +53,8 @@
 #define PHY_USB_ITF_WCID 0x2
 #define PHY_USB_ITF_HID 0x4
 #define PHY_USB_ITF_KB 0x8
+#define PHY_USB_ITF_LWIP 0x10
+#define PHY_USB_ITF_ALL (PHY_USB_ITF_CCID | PHY_USB_ITF_WCID | PHY_USB_ITF_HID | PHY_USB_ITF_KB | PHY_USB_ITF_LWIP)
 
 #define PHY_LED_DRIVER_PICO     0x1
 #define PHY_LED_DRIVER_PIMORONI 0x2
@@ -64,9 +68,17 @@
 
 #define PHY_LED_DRIVER_NONE     0xFF
 
+#define PHY_LED_ORDER_RGB 0x0
+#define PHY_LED_ORDER_RBG 0x1
+#define PHY_LED_ORDER_GRB 0x2
+#define PHY_LED_ORDER_GBR 0x3
+#define PHY_LED_ORDER_BRG 0x4
+#define PHY_LED_ORDER_BGR 0x5
+
 #include <stdint.h>
 #include <stdbool.h>
 
+PACK(
 typedef struct phy_data {
     union {
         struct {
@@ -87,6 +99,7 @@ typedef struct phy_data {
     uint8_t up_btn;
     uint8_t enabled_usb_itf;
     uint8_t led_driver;
+    uint8_t led_order;
 
     bool vidpid_present;
     bool led_gpio_present;
@@ -96,17 +109,20 @@ typedef struct phy_data {
     bool enabled_curves_present;
     bool enabled_usb_itf_present;
     bool led_driver_present;
+    bool led_order_present;
 
-} phy_data_t;
+}) phy_data_t;
 
-#define PHY_MAX_SIZE    ((2+4)+(2+4)+(2+32)+(2+2)+(2+1)+(2+1)+(2+1)+(2+1)+(2+1))
+#define PHY_MAX_SIZE    ((2+4)+(2+4)+(2+32)+(2+2)+(2+1)+(2+1)+(2+1)+(2+1)+(2+2))
 
 #ifndef ENABLE_EMULATION
-extern int phy_serialize_data(const phy_data_t *phy, uint8_t *data, uint16_t *len);
-extern int phy_unserialize_data(const uint8_t *data, uint16_t len, phy_data_t *phy);
-extern int phy_init();
-extern int phy_save();
-extern int phy_load();
+extern int phy_serialize_data(const phy_data_t *phy, byte_buffer_t *data);
+extern int phy_unserialize_data(const_byte_array_t data, phy_data_t *phy);
+/* Validate and merge a partial configuration without changing phy on failure. */
+extern int phy_update_data(const_byte_array_t data, phy_data_t *phy);
+extern int phy_init(void);
+extern int phy_save(void);
+extern int phy_load(void);
 extern phy_data_t phy_data;
 #endif
 

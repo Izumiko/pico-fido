@@ -21,14 +21,20 @@
 
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdbool.h>
 
-void random_init(void);
+#include "byte_array.h"
 
-/* 32-byte random bytes */
-const uint8_t *random_bytes_get(size_t);
-void random_bytes_free(const uint8_t *p);
+typedef struct {
+    uint8_t index;
+    volatile bool cancel;
+} random_fill_iterator_ctx_t;
 
-/* iterator returning a byta at a time */
-extern int random_gen(void *arg, unsigned char *output, size_t output_len);
+extern void
+random_init(void);
+
+extern const uint8_t *random_bytes_get(size_t);
+extern int random_fill_iterator(void *arg, unsigned char *output, size_t output_len);
+extern int random_fill_buffer(byte_array_t buffer);
 
 #endif

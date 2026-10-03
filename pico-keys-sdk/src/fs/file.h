@@ -18,14 +18,10 @@
 #ifndef _FILE_H_
 #define _FILE_H_
 
-#include <stdlib.h>
-#if defined(PICO_PLATFORM)
-#include "pico/stdlib.h"
-#else
-#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
-#endif
-#include "compat.h"
+#include <stdbool.h>
+#include "compat/compat.h"
 #include "phy.h"
 
 #define FILE_TYPE_NOT_KNOWN     0x00
@@ -55,33 +51,61 @@
 #define ACL_OP_UPDATE_ERASE     0x05
 #define ACL_OP_READ_SEARCH      0x06
 
+#define ACL_NONE    { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }
+#define ACL_ALL     { 0 }
+#define ACL_RO      { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00 }
+#define ACL_RW      { 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00 }
+#define ACL_R_WP    { 0xff, 0xff, 0xff, 0xff, 0x90, 0x90, 0x00 }
+#define ACL_WP      { 0xff, 0xff, 0xff, 0xff, 0x90, 0x90, 0xff }
+
 #define SPECIFY_EF 0x1
 #define SPECIFY_DF 0x2
 #define SPECIFY_ANY 0x3
 
-#define EF_PRKDFS   0x6040
-#define EF_PUKDFS   0x6041
-#define EF_CDFS     0x6042
-#define EF_AODFS    0x6043
-#define EF_DODFS    0x6044
-#define EF_SKDFS    0x6045
 #define EF_META     0xE010
-
-#define MAX_DEPTH 4
-
-#define MAX_DYNAMIC_FILES 256
 
 #ifdef _MSC_VER
 __pragma( pack(push, 1) )
 #endif
 typedef struct file {
-    const uint8_t *name;
     uint8_t *data;              //should include 2 bytes len at begining
-    const uint16_t fid;
-    const uint8_t acl[7];
-    const uint8_t parent;       //entry number in the whole table!!
-    const uint8_t type;
-    const uint8_t ef_structure;
+    uint16_t fid;
+}
+#ifndef _MSC_VER
+__attribute__ ((packed))
+#endif
+file_t;
+
+/*
+ * Static files need ISO/CCID metadata. Dynamic files only need the flash
+ * address and FID, so keeping this metadata out of file_t allows the dynamic
+ * index to grow without increasing its historical RAM budget.
+ *
+ * The anonymous union preserves the existing designated initializers for
+ * file_entries[] while making &entry.file a compact file_t handle.
+ */
+typedef struct file_entry {
+#ifdef ENABLE_EMULATION
+    const uint8_t *name;
+#endif
+    union {
+        file_t file;
+        struct {
+            uint8_t *data;
+            uint16_t fid;
+        }
+#ifndef _MSC_VER
+        __attribute__ ((packed))
+#endif
+        ;
+    };
+#ifndef ENABLE_EMULATION
+    const uint8_t *name;
+#endif
+    uint8_t acl[7];
+    uint8_t parent;             //entry number in the whole table!!
+    uint8_t type;
+    uint8_t ef_structure;
 #ifdef ENABLE_EMULATION
     uint32_t _padding;
 #endif
@@ -91,62 +115,58 @@ __pragma( pack(pop) )
 #else
 __attribute__ ((packed))
 #endif
-file_t;
-
-extern bool file_has_data(file_t *);
+file_entry_t;
 
 extern file_t *currentEF;
 extern file_t *currentDF;
 extern const file_t *selected_applet;
 
 extern const file_t *MF;
-extern const file_t *file_last;
-extern const file_t *file_openpgp;
-extern const file_t *file_sc_hsm;
+extern const file_entry_t *file_last;
 extern bool card_terminated;
-extern file_t *file_pin1;
-extern file_t *file_retries_pin1;
-extern file_t *file_sopin;
-extern file_t *file_retries_sopin;
 
-extern file_t *search_by_fid(const uint16_t fid, const file_t *parent, const uint8_t sp);
-extern file_t *search_file(const uint16_t fid);
-extern file_t *search_by_name(uint8_t *name, uint16_t namelen);
-extern file_t *search_by_path(const uint8_t *pe_path, uint8_t pathlen, const file_t *parent);
-extern bool authenticate_action(const file_t *ef, uint8_t op);
-extern void process_fci(const file_t *pe, int fmd);
-extern void scan_flash();
-extern void initialize_flash(bool);
+extern file_t *file_search_by_fid(const uint16_t fid, const file_t *parent, const uint8_t sp);
+extern file_t *file_search(const uint16_t fid);
+extern file_t *file_search_by_name(const_byte_array_t name);
+extern file_t *file_search_by_path(const_byte_array_t path, const file_t *parent);
+extern bool file_authenticate_action(const file_t *ef, uint8_t op);
+extern void file_process_fci(const file_t *pe, int fmd);
+extern void file_scan_flash(void);
+extern void file_initialize_flash(bool);
 
-extern file_t file_entries[];
+extern file_entry_t file_entries[];
 
 extern uint8_t *file_read(const uint8_t *addr);
 extern uint16_t file_read_uint16(const uint8_t *addr);
+extern uint32_t file_read_uint32(const uint8_t *addr);
 extern uint8_t file_read_uint8(const file_t *ef);
 extern uint8_t file_read_uint8_offset(const file_t *ef, const uint16_t offset);
+extern bool file_has_data(const file_t *);
 extern uint8_t *file_get_data(const file_t *tf);
-extern uint16_t file_get_size(const file_t *tf);
-extern int file_put_data(file_t *file, const uint8_t *data, uint16_t len);
+extern uint32_t file_get_size(const file_t *tf);
+extern int file_read_at(const file_t *tf, uint32_t offset, byte_array_t data);
+extern uint8_t file_get_type(const file_t *tf);
+extern int file_put_data(file_t *file, const_byte_array_t data);
+extern int file_put_data_offset(file_t *file, const_byte_array_t data, uint32_t offset);
 extern file_t *file_new(uint16_t);
+extern int flash_clear_file(file_t *file);
+typedef bool (*file_iter_cb)(file_t *file, void *ctx);
+extern void file_for_each_dynamic(file_iter_cb cb, void *ctx);
+typedef struct file_delete_result {
+    int value;
+    int metadata;
+} file_delete_result_t;
+extern file_delete_result_t file_delete_no_commit_parts(file_t *ef);
+extern int file_delete_no_commit(file_t *ef);
+extern int file_delete(file_t *ef);
 file_t *get_parent(file_t *f);
-
-extern uint16_t dynamic_files;
-extern file_t dynamic_file[];
-extern file_t *search_dynamic_file(uint16_t);
-extern int delete_dynamic_file(file_t *f);
 
 extern bool isUserAuthenticated;
 
-extern uint16_t meta_find(uint16_t, uint8_t **out);
+extern byte_array_t meta_find(uint16_t fid);
+extern int meta_delete_no_commit(uint16_t fid);
 extern int meta_delete(uint16_t fid);
-extern int meta_add(uint16_t fid, const uint8_t *data, uint16_t len);
-extern int delete_file(file_t *ef);
-
-extern uint32_t flash_free_space();
-extern uint32_t flash_used_space();
-extern uint32_t flash_total_space();
-extern uint32_t flash_num_files();
-extern uint32_t flash_size();
+extern int meta_add(uint16_t fid, const_byte_array_t data);
 
 #ifndef ENABLE_EMULATION
 extern file_t *ef_phy;

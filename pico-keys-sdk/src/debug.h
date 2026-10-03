@@ -18,33 +18,66 @@
 #ifndef _DEBUG_H_
 #define _DEBUG_H_
 
+#ifdef ENABLE_DIAGNOSTICS
+#define DEBUG_LAST_ERROR_FID 0xE0C2
+#define DEBUG_LAST_ERROR_STRING_SIZE 256
+
+extern int debug_log_errstr(const char *file, int line, const char *format, ...);
+#define log_errstr(...) debug_log_errstr(__FILE__, __LINE__, __VA_ARGS__)
+#else
+#define log_errstr(...) ((void)0)
+#endif
+
 #if defined(DEBUG_APDU) && DEBUG_APDU == 1
-#define DEBUG_PAYLOAD(_p, _s) { \
-        printf("Payload %s (%zu bytes) [%s:%d]:\n", #_p, (size_t)(_s), __FILE__, __LINE__); \
-        for (size_t _i = 0; _i < (size_t)(_s); _i += 16) { \
-            printf("%" PRIxPTR "h : ", (uintptr_t) (_i + _p)); \
-            for (size_t _j = 0; _j < 16; _j++) { \
-                if (_j < (size_t)(_s) - _i) printf("%02X ", (_p)[_i + _j]); \
-                else printf("   "); \
-                if (_j == 7) printf(" "); \
-            } printf(":  "); \
-            for (size_t _j = 0; _j < 16; _j++) { \
-                if (_j < (size_t)(_s) - _i && (_p)[_i + _j] > 32 && (_p)[_i + _j] != 127 && (_p)[_i + _j] < 176) printf("%c", (_p)[_i + _j]); \
-                else printf(" "); \
-                if (_j == 7) printf(" "); \
-            } \
-            printf("\n"); \
-        } printf("\n"); \
-}
-#define DEBUG_DATA(_p, _s) {                                                    \
-        printf("Data %s (%zu bytes) [%s:%d]:\n", #_p, (size_t)(_s), __FILE__, __LINE__);      \
-        char *_tmp = (char *) calloc(2 * (_s) + 1, sizeof(char)); \
-        for (size_t _i = 0; _i < (size_t)(_s); _i++) {    \
-            sprintf(&_tmp[2 * _i], "%02X", (_p)[_i]);       \
-        }                                                \
-        printf("%s\n", _tmp);                             \
-        free(_tmp);                                       \
+#include <inttypes.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "byte_array.h"
+
+static inline void debug_payload_impl(const char *name, const_byte_array_t data, const char *file, int line) {
+    printf("Payload %s (%zu bytes) [%s:%d]:\n", name, data.len, file, line);
+    for (size_t i = 0; i < data.len; i += 16) {
+        printf("%" PRIxPTR "h : ", (uintptr_t)(data.data + i));
+        for (size_t j = 0; j < 16; j++) {
+            if (j < data.len - i) {
+                printf("%02X ", data.data[i + j]);
+            }
+            else {
+                printf("   ");
+            }
+            if (j == 7) {
+                printf(" ");
+            }
+        }
+        printf(":  ");
+        for (size_t j = 0; j < 16; j++) {
+            if (j < data.len - i && data.data[i + j] > 32 && data.data[i + j] != 127 && data.data[i + j] < 176) {
+                printf("%c", data.data[i + j]);
+            }
+            else {
+                printf(" ");
+            }
+            if (j == 7) {
+                printf(" ");
+            }
+        }
+        printf("\n");
     }
+    printf("\n");
+}
+
+static inline void debug_data_impl(const char *name, const_byte_array_t data, const char *file, int line) {
+    printf("Data %s (%zu bytes) [%s:%d]:\n", name, data.len, file, line);
+    for (size_t i = 0; i < data.len; i++) {
+        printf("%02X", data.data[i]);
+    }
+    printf("\n");
+}
+
+#define DEBUG_PAYLOAD(_p, _s) debug_payload_impl(#_p, CONST_BYTE_ARRAY((const uint8_t *)(_p), (size_t)(_s)), __FILE__, __LINE__)
+#define DEBUG_DATA(_p, _s) debug_data_impl(#_p, CONST_BYTE_ARRAY((const uint8_t *)(_p), (size_t)(_s)), __FILE__, __LINE__)
 
 #else
 #define DEBUG_PAYLOAD(_p, _s)

@@ -1,7 +1,0 @@
-[submodule "pico-keys-sdk/mbedtls"]
-	path = pico-keys-sdk/mbedtls
-	url = https://github.com/ARMmbed/mbedtls
-	branch = mbedtls-3.6
-[submodule "pico-keys-sdk/tinycbor"]
-	path = pico-keys-sdk/tinycbor
-	url = https://github.com/intel/tinycbor.git

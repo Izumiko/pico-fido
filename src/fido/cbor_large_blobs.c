@@ -15,17 +15,30 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include "pico_keys.h"
+#include "picokeys.h"
 #include "ctap2_cbor.h"
 #include "fido.h"
 #include "ctap.h"
+#if defined(PICO_PLATFORM)
+#include "bsp/board.h"
+#endif
 #include "hid/ctap_hid.h"
 #include "files.h"
 #include "apdu.h"
 #include "mbedtls/sha256.h"
 
 static uint64_t expectedLength = 0, expectedNextOffset = 0;
+static uint32_t large_blob_timer = 0;
+static bool large_blob_active = false;
 uint8_t temp_lba[MAX_LARGE_BLOB_SIZE];
+
+void cbor_large_blobs_tick(void) {
+    if (large_blob_active && board_millis() - large_blob_timer >= STATEFUL_WALK_IDLE_MS) {
+        expectedLength = 0;
+        expectedNextOffset = 0;
+        large_blob_active = false;
+    }
+}
 
 int cbor_large_blobs(const uint8_t *data, size_t len) {
     CborParser parser;
@@ -34,6 +47,7 @@ int cbor_large_blobs(const uint8_t *data, size_t len) {
     CborError error = CborNoError;
     uint64_t get = 0, offset = UINT64_MAX, length = 0, pinUvAuthProtocol = 0;
     CborByteString set = { 0 }, pinUvAuthParam = { 0 };
+    bool get_present = false, length_present = false, pinUvAuthProtocol_present = false;
 
     CBOR_CHECK(cbor_parser_init(data, len, 0, &parser, &map));
     uint64_t val_c = 1;
@@ -50,6 +64,7 @@ int cbor_large_blobs(const uint8_t *data, size_t len) {
         val_c = val_u + 1;
         if (val_u == 0x01) {
             CBOR_FIELD_GET_UINT(get, 1);
+            get_present = true;
         }
         else if (val_u == 0x02) {
             CBOR_FIELD_GET_BYTES(set, 1);
@@ -59,32 +74,38 @@ int cbor_large_blobs(const uint8_t *data, size_t len) {
         }
         else if (val_u == 0x04) {
             CBOR_FIELD_GET_UINT(length, 1);
+            length_present = true;
         }
         else if (val_u == 0x05) {
             CBOR_FIELD_GET_BYTES(pinUvAuthParam, 1);
         }
         else if (val_u == 0x06) {
             CBOR_FIELD_GET_UINT(pinUvAuthProtocol, 1);
+            pinUvAuthProtocol_present = true;
         }
     }
     CBOR_PARSE_MAP_END(map, 1);
 
+    if (pinUvAuthProtocol_present && pinUvAuthProtocol != 1 && pinUvAuthProtocol != 2) {
+        CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
+    }
+
     if (offset == UINT64_MAX) {
         CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
     }
-    if (get == 0 && set.present == false) {
+    if (get_present == false && set.present == false) {
         CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
     }
-    if (get != 0 && set.present == true) {
+    if (get_present == true && set.present == true) {
         CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
     }
 
     cbor_encoder_init(&encoder, ctap_resp->init.data + 1, CTAP_MAX_CBOR_PAYLOAD, 0);
-    if (get > 0) {
-        if (length != 0) {
+    if (get_present == true) {
+        if (length_present || pinUvAuthParam.present || pinUvAuthProtocol_present) {
             CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
         }
-        if (length > MAX_FRAGMENT_LENGTH) {
+        if (get > MAX_FRAGMENT_LENGTH) {
             CBOR_ERROR(CTAP1_ERR_INVALID_LEN);
         }
         if (offset > file_get_size(ef_largeblob)) {
@@ -92,8 +113,8 @@ int cbor_large_blobs(const uint8_t *data, size_t len) {
         }
         CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 1));
         CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x01));
-        CBOR_CHECK(cbor_encode_byte_string(&mapEncoder, file_get_data(ef_largeblob) + offset,
-                                           MIN(get, file_get_size(ef_largeblob) - offset)));
+        size_t fragment_len = MIN(get, file_get_size(ef_largeblob) - offset);
+        CBOR_CHECK(cbor_encode_byte_string(&mapEncoder, fragment_len > 0 ? file_get_data(ef_largeblob) + offset : NULL, fragment_len));
     }
     else {
         if (set.len > MAX_FRAGMENT_LENGTH) {
@@ -111,6 +132,8 @@ int cbor_large_blobs(const uint8_t *data, size_t len) {
             }
             expectedLength = length;
             expectedNextOffset = 0;
+            large_blob_timer = board_millis();
+            large_blob_active = true;
         }
         else {
             if (length != 0) {
@@ -120,22 +143,29 @@ int cbor_large_blobs(const uint8_t *data, size_t len) {
         if (offset != expectedNextOffset) {
             CBOR_ERROR(CTAP1_ERR_INVALID_SEQ);
         }
-        if (pinUvAuthParam.present == false) {
-            CBOR_ERROR(CTAP2_ERR_PUAT_REQUIRED);
-        }
-        if (pinUvAuthProtocol == 0) {
-            CBOR_ERROR(CTAP2_ERR_MISSING_PARAMETER);
-        }
-        uint8_t verify_data[70] = { 0 };
-        memset(verify_data, 0xff, 32);
-        verify_data[32] = 0x0C;
-        put_uint32_t_le((uint32_t)offset, verify_data + 34);
-        mbedtls_sha256(set.data, set.len, verify_data + 38, 0);
-        if (verify((uint8_t)pinUvAuthProtocol, paut.data, verify_data, (uint16_t)sizeof(verify_data), pinUvAuthParam.data) != 0) {
-            CBOR_ERROR(CTAP2_ERR_PIN_AUTH_INVALID);
-        }
-        if (!(paut.permissions & CTAP_PERMISSION_LBW)) {
-            CBOR_ERROR(CTAP2_ERR_PIN_AUTH_INVALID);
+        bool require_pin_auth = file_has_data(ef_pin) || (get_opts() & FIDO2_OPT_AUV);
+        if (require_pin_auth || pinUvAuthParam.present || pinUvAuthProtocol_present) {
+            if (pinUvAuthParam.present == false) {
+                CBOR_ERROR(CTAP2_ERR_PUAT_REQUIRED);
+            }
+            if (pinUvAuthProtocol_present == false) {
+                CBOR_ERROR(CTAP2_ERR_MISSING_PARAMETER);
+            }
+            size_t expected_auth_len = pinUvAuthProtocol == 1 ? 16u : 32u;
+            if (pinUvAuthParam.len != expected_auth_len) {
+                CBOR_ERROR(CTAP2_ERR_PIN_AUTH_INVALID);
+            }
+            uint8_t verify_data[70] = { 0 };
+            memset(verify_data, 0xff, 32);
+            verify_data[32] = 0x0C;
+            put_uint32_le((uint32_t)offset, verify_data + 34);
+            mbedtls_sha256(set.data, set.len, verify_data + 38, 0);
+            if (verify((uint8_t)pinUvAuthProtocol, paut.data, verify_data, (uint16_t)sizeof(verify_data), pinUvAuthParam.data) != 0) {
+                CBOR_ERROR(CTAP2_ERR_PIN_AUTH_INVALID);
+            }
+            if (!(paut.permissions & CTAP_PERMISSION_LBW)) {
+                CBOR_ERROR(CTAP2_ERR_PIN_AUTH_INVALID);
+            }
         }
         if (offset + set.len > expectedLength) {
             CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
@@ -145,14 +175,18 @@ int cbor_large_blobs(const uint8_t *data, size_t len) {
         }
         memcpy(temp_lba + expectedNextOffset, set.data, set.len);
         expectedNextOffset += set.len;
+        large_blob_timer = board_millis();
         if (expectedNextOffset == expectedLength) {
             uint8_t sha[32];
             mbedtls_sha256(temp_lba, expectedLength - 16, sha, 0);
-            if (expectedLength > 17 && memcmp(sha, temp_lba + expectedLength - 16, 16) != 0) {
+            if (memcmp(sha, temp_lba + expectedLength - 16, 16) != 0) {
                 CBOR_ERROR(CTAP2_ERR_INTEGRITY_FAILURE);
             }
-            file_put_data(ef_largeblob, temp_lba, (uint16_t)expectedLength);
-            low_flash_available();
+            file_put_data(ef_largeblob, CONST_BYTE_ARRAY(temp_lba, expectedLength));
+            flash_commit();
+            expectedLength = 0;
+            expectedNextOffset = 0;
+            large_blob_active = false;
         }
         goto err;
     }
@@ -162,7 +196,10 @@ err:
     CBOR_FREE_BYTE_STRING(pinUvAuthParam);
     CBOR_FREE_BYTE_STRING(set);
     if (error != CborNoError) {
-        return -CTAP2_ERR_INVALID_CBOR;
+        if (error == CborErrorImproperValue) {
+            return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+        }
+        return error;
     }
     res_APDU_size = (uint16_t)cbor_encoder_get_buffer_size(&encoder, ctap_resp->init.data + 1);
     return 0;

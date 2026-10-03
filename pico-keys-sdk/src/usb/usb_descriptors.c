@@ -15,23 +15,20 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include "pico_keys.h"
+#include "picokeys.h"
 #include "tusb.h"
-#include "usb_descriptors.h"
-#if defined(PICO_PLATFORM)
-#include "pico/unique_id.h"
-#endif
 #ifdef ESP_PLATFORM
 #include "tinyusb.h"
 #endif
-#include "pico_keys_version.h"
+#include "picokeys_version.h"
 #include "usb.h"
+#include "serial.h"
 
 #ifndef USB_VID
-#define USB_VID   0xFEFF
+#define USB_VID   0x2E8A
 #endif
 #ifndef USB_PID
-#define USB_PID   0xFCFD
+#define USB_PID   0x10FD
 #endif
 
 #if defined(PICO_PLATFORM) || defined(ESP_PLATFORM)
@@ -59,7 +56,7 @@ tusb_desc_device_t desc_device = {
 
     .idVendor           = (USB_VID),
     .idProduct          = (USB_PID),
-    .bcdDevice          = PICO_KEYS_SDK_VERSION,
+    .bcdDevice          = PICOKEYS_SDK_VERSION,
 
     .iManufacturer      = 1,
     .iProduct           = 2,
@@ -94,6 +91,9 @@ enum {
 #ifdef USB_ITF_CCID
     + TUSB_SMARTCARD_CCID_DESC_LEN + TUSB_SMARTCARD_WCID_DESC_LEN
 #endif
+#ifdef USB_ITF_LWIP
+    + TUD_CDC_NCM_DESC_LEN
+#endif
 )
 };
 
@@ -106,7 +106,8 @@ uint8_t const desc_hid_report_kb[] = {
 };
 #endif
 
-enum {
+enum
+{
     EPNUM_DUMMY = 0,
 #ifdef USB_ITF_CCID
     EPNUM_CCID,
@@ -118,6 +119,10 @@ enum {
 #ifdef USB_ITF_HID
     EPNUM_HID,
     EPNUM_HID_KB,
+#endif
+#ifdef USB_ITF_LWIP
+    EPNUM_LWIP_NOTIF,
+    EPNUM_LWIP,
 #endif
     EPNUM_TOTAL
 };
@@ -144,7 +149,7 @@ enum {
 #endif
 
 uint8_t desc_config[MAX_TUSB_DESC_TOTAL_LEN] = {
-    TUD_CONFIG_DESCRIPTOR(1, 0, 4, 0, USB_CONFIG_ATT_ONE | TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, MAX_USB_POWER)
+    TUD_CONFIG_DESCRIPTOR(1, 0, 0, 0, USB_CONFIG_ATT_ONE | TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, MAX_USB_POWER)
 };
 
 #ifdef USB_ITF_HID
@@ -160,7 +165,7 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t itf) {
 }
 #endif
 
-void usb_desc_setup() {
+void usb_desc_setup(void) {
     desc_config[4] = ITF_TOTAL;
     TUSB_DESC_TOTAL_LEN = TUD_CONFIG_DESC_LEN;
     uint8_t *p = desc_config + TUD_CONFIG_DESC_LEN;
@@ -192,6 +197,14 @@ void usb_desc_setup() {
         p += sizeof(desc_wcid);
     }
 #endif
+#ifdef USB_ITF_LWIP
+    if (ITF_LWIP != ITF_INVALID) {
+        TUSB_DESC_TOTAL_LEN += TUD_CDC_NCM_DESC_LEN;
+        const uint8_t desc_lwip[] = { TUD_CDC_NCM_DESCRIPTOR(ITF_LWIP, ITF_LWIP + 5, 4, EPNUM_LWIP_NOTIF | TUSB_DIR_IN_MASK, 64, EPNUM_LWIP, EPNUM_LWIP | TUSB_DIR_IN_MASK, CFG_TUD_NET_ENDPOINT_SIZE, CFG_TUD_NET_MTU) };
+        memcpy(p, desc_lwip, sizeof(desc_lwip));
+        p += sizeof(desc_lwip);
+    }
+#endif
     desc_config[2] = TUSB_DESC_TOTAL_LEN & 0xFF;
     desc_config[3] = TUSB_DESC_TOTAL_LEN >> 8;
 }
@@ -207,7 +220,11 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
 #ifdef USB_ITF_WCID
 
 #define BOS_TOTAL_LEN     (TUD_BOS_DESC_LEN + TUD_BOS_WEBUSB_DESC_LEN + TUD_BOS_MICROSOFT_OS_DESC_LEN)
+#ifdef USB_ITF_LWIP
+#define MS_OS_20_DESC_LEN  0xCE
+#else
 #define MS_OS_20_DESC_LEN  0xB2
+#endif
 
 enum
 {
@@ -224,9 +241,7 @@ const tusb_desc_webusb_url_t desc_url =
   .bScheme         = 1, // 0: http, 1: https
   .url             = URL
 };
-#define BOS_TOTAL_LEN      (TUD_BOS_DESC_LEN + TUD_BOS_WEBUSB_DESC_LEN + TUD_BOS_MICROSOFT_OS_DESC_LEN)
 
-#define MS_OS_20_DESC_LEN  0xB2
 uint8_t desc_ms_os_20[] = {
   // Set header: length, type, windows version, total length
   U16_TO_U8S_LE(0x000A), U16_TO_U8S_LE(MS_OS_20_SET_HEADER_DESCRIPTOR), U32_TO_U8S_LE(0x06030000), U16_TO_U8S_LE(MS_OS_20_DESC_LEN),
@@ -234,25 +249,35 @@ uint8_t desc_ms_os_20[] = {
   // Configuration subset header: length, type, configuration index, reserved, configuration total length
   U16_TO_U8S_LE(0x0008), U16_TO_U8S_LE(MS_OS_20_SUBSET_HEADER_CONFIGURATION), 0, 0, U16_TO_U8S_LE(MS_OS_20_DESC_LEN-0x0A),
 
-  // Function Subset header: length, type, first interface, reserved, subset length
-  U16_TO_U8S_LE(0x0008), U16_TO_U8S_LE(MS_OS_20_SUBSET_HEADER_FUNCTION), 0/*ITF_WCID*/, 0, U16_TO_U8S_LE(MS_OS_20_DESC_LEN-0x0A-0x08),
+  // Function Subset header for WebCCID (WINUSB): length, type, first interface, reserved, subset length
+  U16_TO_U8S_LE(0x0008), U16_TO_U8S_LE(MS_OS_20_SUBSET_HEADER_FUNCTION), 0/*ITF_WCID*/, 0, U16_TO_U8S_LE(0x00A0),
 
   // MS OS 2.0 Compatible ID descriptor: length, type, compatible ID, sub compatible ID
   U16_TO_U8S_LE(0x0014), U16_TO_U8S_LE(MS_OS_20_FEATURE_COMPATBLE_ID), 'W', 'I', 'N', 'U', 'S', 'B', 0x00, 0x00,
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // sub-compatible
 
   // MS OS 2.0 Registry property descriptor: length, type
-  U16_TO_U8S_LE(MS_OS_20_DESC_LEN-0x0A-0x08-0x08-0x14), U16_TO_U8S_LE(MS_OS_20_FEATURE_REG_PROPERTY),
+  U16_TO_U8S_LE(0x0084), U16_TO_U8S_LE(MS_OS_20_FEATURE_REG_PROPERTY),
   U16_TO_U8S_LE(0x0007), U16_TO_U8S_LE(0x002A), // wPropertyDataType, wPropertyNameLength and PropertyName "DeviceInterfaceGUIDs\0" in UTF-16
   'D', 0x00, 'e', 0x00, 'v', 0x00, 'i', 0x00, 'c', 0x00, 'e', 0x00, 'I', 0x00, 'n', 0x00, 't', 0x00, 'e', 0x00,
   'r', 0x00, 'f', 0x00, 'a', 0x00, 'c', 0x00, 'e', 0x00, 'G', 0x00, 'U', 0x00, 'I', 0x00, 'D', 0x00, 's', 0x00, 0x00, 0x00,
   U16_TO_U8S_LE(0x0050), // wPropertyDataLength
-	//bPropertyData: “{975F44D9-0D08-43FD-8B3E-127CA8AFFF9D}”.
+  //bPropertyData: “{975F44D9-0D08-43FD-8B3E-127CA8AFFF9D}”.
   '{', 0x00, '9', 0x00, '7', 0x00, '5', 0x00, 'F', 0x00, '4', 0x00, '4', 0x00, 'D', 0x00, '9', 0x00, '-', 0x00,
   '0', 0x00, 'D', 0x00, '0', 0x00, '8', 0x00, '-', 0x00, '4', 0x00, '3', 0x00, 'F', 0x00, 'D', 0x00, '-', 0x00,
   '8', 0x00, 'B', 0x00, '3', 0x00, 'E', 0x00, '-', 0x00, '1', 0x00, '2', 0x00, '7', 0x00, 'C', 0x00, 'A', 0x00,
   '8', 0x00, 'A', 0x00, 'F', 0x00, 'F', 0x00, 'F', 0x00, '9', 0x00, 'D', 0x00, '}', 0x00, 0x00, 0x00, 0x00, 0x00
+#ifdef USB_ITF_LWIP
+  ,
+  // Function Subset header for NCM (WINNCM): length, type, first interface, reserved, subset length
+  U16_TO_U8S_LE(0x0008), U16_TO_U8S_LE(MS_OS_20_SUBSET_HEADER_FUNCTION), 0/*ITF_LWIP*/, 0, U16_TO_U8S_LE(0x001C),
+
+  // MS OS 2.0 Compatible ID descriptor for NCM
+  U16_TO_U8S_LE(0x0014), U16_TO_U8S_LE(MS_OS_20_FEATURE_COMPATBLE_ID), 'W', 'I', 'N', 'N', 'C', 'M', 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+#endif
 };
+TU_VERIFY_STATIC(sizeof(desc_ms_os_20) == MS_OS_20_DESC_LEN, "Incorrect size");
 bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const * request) {
     // nothing to with DATA & ACK stage
     if (stage != CONTROL_STAGE_SETUP)
@@ -269,6 +294,9 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
                         // Get Microsoft OS 2.0 compatible descriptor
                         uint16_t total_len;
                         desc_ms_os_20[22] = ITF_WCID;
+#ifdef USB_ITF_LWIP
+                        desc_ms_os_20[182] = ITF_LWIP;
+#endif
                         memcpy(&total_len, desc_ms_os_20+8, 2);
                         return tud_control_xfer(rhport, request, (void*)(uintptr_t) desc_ms_os_20, total_len);
                     }
@@ -316,27 +344,29 @@ uint8_t const *tud_descriptor_bos_cb(void) {
 //--------------------------------------------------------------------+
 
 // array of pointer to string descriptors
+char *string_desc_itf[5] = {0};
 char const *string_desc_arr [] = {
     (const char[]) { 0x09, 0x04 }, // 0: is supported language is English (0x0409)
     "Pol Henarejos",                     // 1: Manufacturer
     "Pico Key",                       // 2: Product
     "11223344",                      // 3: Serials, should use chip ID
-    "Config"               // 4: Vendor Interface
-#ifdef USB_ITF_HID
+    "MAC"                   // 4: MAC address string, handled separately
     , "HID Interface"
     , "HID Keyboard Interface"
-#endif
-#ifdef USB_ITF_CCID
+#ifdef USB_ITF_HID
     , "CCID OTP FIDO Interface"
-    , "WebCCID Interface"
+#else
+    , "CCID Interface"
 #endif
+    , "WebCCID Interface"
+    , "Network Interface"
 };
 
 #ifdef ESP_PLATFORM
 tinyusb_config_t tusb_cfg = {
     .device_descriptor = &desc_device,
     .string_descriptor = string_desc_arr,
-    .string_descriptor_count = (sizeof(string_desc_arr) / sizeof(string_desc_arr[0])) > 8 ? 8 : (sizeof(string_desc_arr) / sizeof(string_desc_arr[0])),
+    .string_descriptor_count = (sizeof(string_desc_arr) / sizeof(string_desc_arr[0])),
     .external_phy = false,
     .configuration_descriptor = desc_config,
 };
@@ -369,9 +399,21 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
                 str = phy_data.usb_product;
             }
         }
+        else if (index >= 6 && string_desc_itf[index - 6] != NULL) {
+            str = string_desc_itf[index - 6];
+        }
+        else if (index == 5) {
+#ifdef USB_ITF_LWIP
+            chr_count = 0;
+            for (unsigned i = 0; i < sizeof(tud_network_mac_address); i++) {
+                _desc_str[1 + chr_count++] = "0123456789ABCDEF"[(tud_network_mac_address[i] >> 4) & 0xf];
+                _desc_str[1 + chr_count++] = "0123456789ABCDEF"[(tud_network_mac_address[i] >> 0) & 0xf];
+            }
+#endif
+        }
 
         uint8_t buff_avail = sizeof(_desc_str) / sizeof(_desc_str[0]) - 1;
-        if (index >= 4) {
+        if (index >= 6) {
             const char *product = phy_data.usb_product_present ? phy_data.usb_product : string_desc_arr[2];
             uint8_t len = (uint8_t)MIN(strlen(product), buff_avail);
             for (size_t ix = 0; ix < len; chr_count++, ix++) {

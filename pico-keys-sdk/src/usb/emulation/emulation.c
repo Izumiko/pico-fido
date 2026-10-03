@@ -14,8 +14,14 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
-
-#include "pico_keys.h"
+#ifdef _MSC_VER
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#endif
 #include "emulation.h"
 #include <stdio.h>
 #ifndef _MSC_VER
@@ -30,7 +36,6 @@ typedef int socket_t;
 #define INVALID_SOCKET (-1)
 #define SOCKET_ERROR (-1)
 #else
-#include <ws2tcpip.h>
 #define O_NONBLOCK _O_NONBLOCK
 #define close closesocket
 typedef SOCKET socket_t;
@@ -47,8 +52,10 @@ typedef int socklen_t;
 #include "ccid/ccid.h"
 #include "hid/ctap_hid.h"
 
-socket_t ccid_sock = 0;
-socket_t hid_server_sock = 0;
+#define PICOKEYS_EMULATION_DISABLE_CCID_ENV "PICOKEYS_EMULATION_DISABLE_CCID"
+
+socket_t ccid_sock = INVALID_SOCKET;
+socket_t hid_server_sock = INVALID_SOCKET;
 socket_t hid_client_sock = INVALID_SOCKET;
 extern uint8_t thread_type;
 extern const uint8_t *cbor_data;
@@ -59,8 +66,18 @@ uint16_t emul_rx_size = 0, emul_tx_size = 0;
 extern int cbor_parse(uint8_t cmd, const uint8_t *data, size_t len);
 pthread_t hcore0, hcore1;
 
+#ifdef _MSC_VER
+static void log_sock_error(const char *ctx) {
+    fprintf(stderr, "%s failed (WSAGetLastError=%d)\n", ctx, WSAGetLastError());
+}
+#else
+static void log_sock_error(const char *ctx) {
+    fprintf(stderr, "%s failed (errno=%d)\n", ctx, errno);
+}
+#endif
+
 #ifndef _MSC_VER
-int msleep(long msec) {
+static int msleep(long msec) {
     struct timespec ts;
     int res;
 
@@ -80,8 +97,7 @@ int msleep(long msec) {
 }
 #endif
 
-int emul_init(char *host, uint16_t port) {
-    struct sockaddr_in serv_addr;
+int emul_init(const char *host, uint16_t port) {
     fprintf(stderr, "\n Starting emulation envionrment\n");
 #ifdef _MSC_VER
     WSADATA wsaData;
@@ -89,37 +105,43 @@ int emul_init(char *host, uint16_t port) {
         printf("winsock initialization failure\n");
     }
 #endif
-    if ((ccid_sock = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) {
-        perror("socket");
-        return -1;
-    }
+#ifdef USB_ITF_CCID
+    if (!getenv(PICOKEYS_EMULATION_DISABLE_CCID_ENV)) {
+        struct sockaddr_in serv_addr;
+        if ((ccid_sock = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) {
+            log_sock_error("socket(ccid)");
+        }
+        else {
+            serv_addr.sin_family = AF_INET;
+            serv_addr.sin_port = htons(port);
 
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(port);
-
-    // Convert IPv4 and IPv6 addresses from text to binary
-    // form
-    if (inet_pton(AF_INET, host, &serv_addr.sin_addr) <= 0) {
-        perror("inet_pton");
-        close(ccid_sock);
-        return -1;
-    }
-
-    if (connect(ccid_sock, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
-        perror("connect");
-        close(ccid_sock);
-        return -1;
-    }
+            // Convert IPv4 and IPv6 addresses from text to binary
+            // form
+            if (inet_pton(AF_INET, host, &serv_addr.sin_addr) <= 0) {
+                log_sock_error("inet_pton(ccid)");
+                close(ccid_sock);
+                ccid_sock = INVALID_SOCKET;
+            }
+            else if (connect(ccid_sock, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
+                log_sock_error("connect(ccid)");
+                close(ccid_sock);
+                ccid_sock = INVALID_SOCKET;
+            }
+        }
+        if (ccid_sock != INVALID_SOCKET) {
 #ifdef _MSC_VER
-    unsigned long on = 1;
-    if (0 != ioctlsocket(ccid_sock, FIONBIO, &on)) {
-        perror("ioctlsocket FIONBIO");
-    }
+            unsigned long on = 1;
+            if (0 != ioctlsocket(ccid_sock, FIONBIO, &on)) {
+                perror("ioctlsocket FIONBIO");
+            }
 #else
-    int x = fcntl(ccid_sock, F_GETFL, 0);
-    fcntl(ccid_sock, F_SETFL, x | O_NONBLOCK);
-    int flag = 1;
-    setsockopt(ccid_sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+            int x = fcntl(ccid_sock, F_GETFL, 0);
+            fcntl(ccid_sock, F_SETFL, x | O_NONBLOCK);
+            int flag = 1;
+            setsockopt(ccid_sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+#endif
+        }
+    }
 #endif
 
     // HID server
@@ -129,12 +151,12 @@ int emul_init(char *host, uint16_t port) {
     struct sockaddr_in server_sockaddr;
 
     if ((hid_server_sock = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) {
-        perror("socket");
+        log_sock_error("socket(hid_server)");
         return -1;
     }
 
     if (setsockopt(hid_server_sock, SOL_SOCKET, SO_REUSEADDR, (void *) &yes, sizeof yes) != 0) {
-        perror("setsockopt");
+        log_sock_error("setsockopt(SO_REUSEADDR)");
         close(hid_server_sock);
         return 1;
     }
@@ -154,20 +176,21 @@ int emul_init(char *host, uint16_t port) {
 
     if (bind(hid_server_sock, (struct sockaddr *) &server_sockaddr,
              sizeof server_sockaddr) != 0) {
-        perror("bind");
+        log_sock_error("bind(hid_server)");
         close(hid_server_sock);
         return 1;
     }
 
-    if (listen(hid_server_sock, 0) != 0) {
-        perror("listen");
+    if (listen(hid_server_sock, SOMAXCONN) != 0) {
+        log_sock_error("listen(hid_server)");
         close(hid_server_sock);
         return 1;
     }
+    fprintf(stderr, "HID server listening on 0.0.0.0:%u\n", hid_port);
     return 0;
 }
 
-socket_t get_sock_itf(uint8_t itf) {
+static socket_t get_sock_itf(uint8_t itf) {
 #ifdef USB_ITF_CCID
     if (itf == ITF_CCID) {
         return ccid_sock;
@@ -182,7 +205,7 @@ socket_t get_sock_itf(uint8_t itf) {
 }
 
 uint32_t tud_vendor_n_write(uint8_t itf, const uint8_t *buffer, uint32_t n) {
-    uint16_t ret = driver_write_emul(ITF_CCID, buffer, (uint16_t)n);
+    uint16_t ret = driver_write_emul(ITF_CCID, CONST_BYTE_ARRAY(buffer, (uint16_t)n));
     tud_vendor_tx_cb(itf, ret);
     return ret;
 }
@@ -191,16 +214,27 @@ uint32_t tud_vendor_n_write(uint8_t itf, const uint8_t *buffer, uint32_t n) {
 bool tud_hid_n_report(uint8_t itf, uint8_t report_id, const uint8_t *buffer, uint32_t n) {
     (void) itf;
     (void) report_id;
-    uint16_t ret = driver_write_emul(ITF_HID, buffer, (uint16_t)n);
+    uint16_t ret = driver_write_emul(ITF_HID, CONST_BYTE_ARRAY(buffer, (uint16_t)n));
     return ret > 0;
 }
 #endif
 
-uint16_t driver_write_emul(uint8_t itf, const uint8_t *buffer, uint16_t buffer_size) {
-    uint16_t size = htons(buffer_size);
+uint16_t driver_write_emul(uint8_t itf, const_byte_array_t buffer) {
+    if (buffer.len > UINT16_MAX) {
+        return 0;
+    }
+    uint16_t buffer_len = (uint16_t)buffer.len;
+    uint16_t size = htons(buffer_len);
     socket_t sock = get_sock_itf(itf);
+    if (sock == INVALID_SOCKET) {
+        return 0;
+    }
     // DEBUG_PAYLOAD(buffer,buffer_size);
+#ifdef _WIN32
     int ret = 0;
+#else
+    ssize_t ret = 0;
+#endif
     do {
         ret = send(sock, (const char *)&size, sizeof(size), 0);
         if (ret == SOCKET_ERROR) {
@@ -208,13 +242,13 @@ uint16_t driver_write_emul(uint8_t itf, const uint8_t *buffer, uint16_t buffer_s
         }
     } while (ret <= 0);
     do {
-        ret = send(sock, (const char *)buffer, buffer_size, 0);
+        ret = send(sock, (const char *)buffer.data, (int)buffer_len, 0);
         if (ret == SOCKET_ERROR) {
             msleep(10);
         }
     } while (ret <= 0);
-    emul_tx_size = buffer_size;
-    return buffer_size;
+    emul_tx_size = buffer_len;
+    return buffer_len;
 }
 
 void driver_exec_finished_cont_emul(uint8_t itf, uint16_t size_next, uint16_t offset) {
@@ -225,7 +259,7 @@ void driver_exec_finished_cont_emul(uint8_t itf, uint16_t size_next, uint16_t of
 #endif
 #ifdef USB_ITF_CCID
     if (itf == ITF_CCID) {
-        driver_write_emul(itf, emul_tx + offset, size_next);
+        driver_write_emul(itf, CONST_BYTE_ARRAY(emul_tx + offset, size_next));
     }
 #endif
 }
@@ -238,7 +272,11 @@ uint16_t emul_read(uint8_t itf) {
         socklen_t client_socklen = sizeof client_sockaddr;
 
         int timeout;
+#ifdef _MSC_VER
+        WSAPOLLFD pfd;
+#else
         struct pollfd pfd;
+#endif
 
         pfd.fd = hid_server_sock;
         pfd.events = POLLIN;
@@ -246,7 +284,11 @@ uint16_t emul_read(uint8_t itf) {
 
         timeout = (0 * 1000 + 1000 / 1000);
 
+#ifdef _MSC_VER
+        if (WSAPoll(&pfd, 1, timeout) == SOCKET_ERROR) {
+#else
         if (poll(&pfd, 1, timeout) == -1) {
+#endif
             return 0;
         }
 
@@ -256,7 +298,7 @@ uint16_t emul_read(uint8_t itf) {
             }
             hid_client_sock = accept(hid_server_sock, (struct sockaddr *) &client_sockaddr, &client_socklen);
             if (hid_client_sock != INVALID_SOCKET) {
-                printf("hid_client connected! %d\n", hid_client_sock);
+                printf("hid_client connected! %llu\n", (unsigned long long)hid_client_sock);
             }
         }
         /*if (send_buffer_size > 0) {
@@ -266,6 +308,9 @@ uint16_t emul_read(uint8_t itf) {
     }
 #endif
     socket_t sock = get_sock_itf(itf);
+    if (sock == INVALID_SOCKET) {
+        return 0;
+    }
     //printf("get_sockt itf %d - %d\n", itf, sock);
     uint16_t len = 0;
     fd_set input;
@@ -279,7 +324,11 @@ uint16_t emul_read(uint8_t itf) {
     __pragma(warning(pop))
 #endif
     struct timeval timeout;
+#ifdef _WIN32
     int valread = 0;
+#else
+    ssize_t valread = 0;
+#endif
     timeout.tv_sec = 0;
     timeout.tv_usec = 0 * 1000;
     int n = select((int)(sock + 1), &input, NULL, NULL, &timeout);
@@ -300,7 +349,7 @@ uint16_t emul_read(uint8_t itf) {
                     if (len == 1) {
                         uint8_t c = emul_rx[0];
                         if (c == 4) {
-                            driver_write_emul(itf, ccid_atr ? ccid_atr + 1 : NULL, ccid_atr ? ccid_atr[0] : 0);
+                            driver_write_emul(itf, CONST_BYTE_ARRAY(ccid_atr ? ccid_atr + 1 : NULL, ccid_atr ? ccid_atr[0] : 0));
                         }
                     }
 #ifdef USB_ITF_CCID
@@ -308,19 +357,19 @@ uint16_t emul_read(uint8_t itf) {
                         uint16_t sent = 0;
                         DEBUG_PAYLOAD(emul_rx, len);
                         apdu.rdata = emul_tx;
-                        if ((sent = apdu_process(itf, emul_rx, len)) > 0) {
+                        if ((sent = apdu_process(itf, CONST_BYTE_ARRAY(emul_rx, len))) > 0) {
                             process_apdu();
                             apdu_finish();
                         }
                         if (sent > 0) {
                             uint16_t ret = apdu_next();
                             DEBUG_PAYLOAD(apdu.rdata, ret);
-                            driver_write_emul(itf, apdu.rdata, ret);
+                            driver_write_emul(itf, CONST_BYTE_ARRAY(apdu.rdata, ret));
                         }
                     }
 #endif
                     else {
-                        emul_rx_size += valread;
+                        emul_rx_size += (uint16_t)valread;
                     }
                     return (uint16_t)emul_rx_size;
                 }
@@ -333,7 +382,7 @@ uint16_t emul_read(uint8_t itf) {
     return emul_rx_size;
 }
 
-void emul_task() {
+void emul_task(void) {
 #ifdef USB_ITF_CCID
     emul_read(ITF_CCID);
 #endif
